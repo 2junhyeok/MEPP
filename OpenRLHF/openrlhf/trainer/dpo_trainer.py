@@ -7,6 +7,7 @@ from tqdm import tqdm
 
 from openrlhf.models import DPOLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
+from openrlhf.utils.utils import pair_entropy
 
 
 class DPOTrainer(ABC):
@@ -185,6 +186,18 @@ class DPOTrainer(ABC):
                 acc_sum += acc
                 loss_sum += preference_loss.item()
                 # dpo logs
+                
+                prompt_lens_tensor = torch.tensor(prompt_id_lens, device = c_mask.device)
+                
+                chosen_len = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+                rejected_len = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+
+                # length normalization
+                chosen_logps_norm = chosen_logps / chosen_len
+                rejected_logps_norm = rejected_logps / rejected_len
+                
+                pair_entropy_value = pair_entropy(chosen_logps_norm, rejected_logps_norm).item()
+                
                 logs_dict = {
                     "loss": preference_loss.item(),
                     "acc": acc,
@@ -192,6 +205,7 @@ class DPOTrainer(ABC):
                     "reject_reward": reject_reward.mean().item(),
                     "lr": self.scheduler.get_last_lr()[0],
                     "grad_norm": self.strategy.get_grad_norm(self.model),
+                    "pair_entropy": pair_entropy_value,
                 }
                 if self.nll_loss:
                     logs_dict["nll_loss"] = nll_loss.item()

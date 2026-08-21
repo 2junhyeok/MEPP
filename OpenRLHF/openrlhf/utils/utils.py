@@ -120,3 +120,14 @@ def remove_pad_token(input_ids: torch.Tensor, attention_mask: torch.Tensor):
         # Fix for both left and right padding
         no_padding_batch.append((ids[mask.bool()]))
     return no_padding_batch
+
+def pair_entropy(chosen_logps_norm, rejected_logps_norm, eps=1e-8):
+    """
+    Args:
+        chosen_logps, rejected_logps: [batch_size], raw policy sequence log-liklihood
+    """
+    diff = (chosen_logps_norm - rejected_logps_norm).float().clamp(-100, 100)
+    q = torch.sigmoid(diff).clamp(eps, 1 - eps)
+    h = -(q * torch.log(q) + (1 - q) * torch.log(1 - q)) # h(q) = -qlogq -(1-q)log(1-q)
+    return h.mean()
+
