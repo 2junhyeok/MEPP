@@ -5,8 +5,9 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 deepspeed --num_gpus 8 --module openrlhf.cli.train_sft \
   --data.dataset ~/ljh/MEPP/data/openr1_dpo \
-  --data.input_key prompt \
-  --data.output_key chosen \
+  --data.chosen_key chosen \
+  --data.rejected_key rejected \
+  --data.prompt_key prompt \
   --data.apply_chat_template \
   --data.max_len 8192 \
   --train.batch_size 16 \
@@ -17,6 +18,7 @@ deepspeed --num_gpus 8 --module openrlhf.cli.train_sft \
   --ckpt.save_steps 500 \
   --ckpt.save_hf \
   --logger.logging_steps 1 \
+  --logger.wandb.key "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" \
   --logger.wandb.project "openr1-comparison" \
   --logger.wandb.run_name "qwen2.5-math-1.5b-sft-chosen" \
   --eval.steps 50 \

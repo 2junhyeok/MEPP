@@ -8,7 +8,8 @@ from tqdm import tqdm
 from openrlhf.models import SFTLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
 from openrlhf.utils.loss_utils import iter_grad_accum_global_norm
-
+from openrlhf.utils.utils import masked_mean
+from openrlhf.utils.utils import pair_entropy
 
 class SFTTrainer(ABC):
     """
@@ -150,19 +151,32 @@ class SFTTrainer(ABC):
             # (not per micro-batch). mask_fn extracts the shifted loss mask -- the same mask
             # aggregate_loss reduces over -- from each (inputs, attention_masks, loss_masks) batch.
             def sft_loss_mask(batch):
-                return batch[2].squeeze(1)[:, :-1]
+                chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens = batch
+                c_mask = c_mask.squeeze(1)
+                resp_mask = c_mask.clone().bool()
+                for i, p_len in enumerate(prompt_id_lens):
+                    resp_mask[i, :p_len] = False
+                return resp_mask[:, 1:]
 
-            for (inputs, attention_masks, loss_masks), loss_batch_info in iter_grad_accum_global_norm(
+            for data, loss_batch_info in iter_grad_accum_global_norm(
                 self.train_dataloader, self.strategy, self.strategy.accumulated_gradient, sft_loss_mask
             ):
-                inputs = inputs.to(device).squeeze(1)
-                attention_mask = attention_masks.to(device).squeeze(1)
-                loss_mask = loss_masks.to(device).squeeze(1)
+                chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens = data
+                chosen_ids = chosen_ids.squeeze(1).to(device)
+                c_mask = c_mask.squeeze(1).to(device)
+                reject_ids = reject_ids.squeeze(1).to(device)
+                r_mask = r_mask.squeeze(1).to(device)
+                
+                input_ids, attention_mask, doubled_prompt_lens = self.concatenated_inputs(
+                    chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
+                )
+                
                 per_token_log_probs, output = self.model(
-                    inputs,
+                    input_ids,
                     attention_mask=attention_mask,
                     return_output=True,
                     return_logprobs=True,
+                    return_entropy=True,
                     ring_attn_group=self.strategy.ring_attn_group,
                 )
 
@@ -171,21 +185,72 @@ class SFTTrainer(ABC):
                     aux_loss = output.aux_loss
                 else:
                     aux_loss = 0
-                shifted_loss_mask = loss_mask[:, :-1]
+                
+                
+                B = chosen_ids.shape[0]
+                
+                # chosen loss
+                chosen_log_probs = per_token_log_probs[:B]
+                chosen_att_mask = attention_mask[:B]
+                chosen_loss_mask = torch.zeros_like(chosen_att_mask, dtype=torch.bool)
+                chosen_resp_mask = chosen_att_mask.clone().bool()
+                for i, p_len in enumerate(prompt_id_lens):
+                    chosen_resp_mask[i, :p_len] = False
+                chosen_shifted_mask = chosen_resp_mask[:, 1:]
+                
+                chosen_entropy_value = 0.0
+                reject_entropy_value = 0.0
+                if hasattr(output, "entropy") and output.entropy is not None:
+                    with torch.no_grad():
+                        entropy = output.entropy # [2B, T-1]
+                        reject_att_mask = attention_mask[B:]
+                        reject_resp_mask = reject_att_mask.clone().bool()
+                        for i, p_len in enumerate(prompt_id_lens):
+                            reject_resp_mask[i, :p_len] = False
+                        reject_shifted_mask = reject_resp_mask[:, 1:]
+                        
+                        chosen_entropy_value = masked_mean(entropy[:B], chosen_shifted_mask).item()
+                        reject_entropy_value = masked_mean(entropy[B:], reject_shifted_mask).item()
+                
+                
+                if hasattr(output, "logits"):
+                    del output.logits
+                
                 gpt_loss = self.loss_fn(
-                    per_token_log_probs,
-                    shifted_loss_mask,
+                    chosen_log_probs,
+                    chosen_shifted_mask,
                     **loss_batch_info,
                 )
                 loss = gpt_loss + aux_loss * self.args.model.aux_loss_coef
                 self.strategy.backward(loss, self.model, self.optimizer)
                 self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
 
+
+
+
+                    
+                with torch.no_grad():
+                    all_logps_sum, _ = self._get_batch_logps(per_token_log_probs, attention_mask, doubled_prompt_lens)
+                    chosen_logps = all_logps_sum[:B]
+                    rejected_logps = all_logps_sum[B:]
+
+                    prompt_lens_tensor = torch.tensor(prompt_id_lens, device=c_mask.device)
+                    chosen_len = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+                    rejected_len = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+
+                    chosen_logps_norm = chosen_logps / chosen_len
+                    rejected_logps_norm = rejected_logps / rejected_len
+
+                    pair_entropy_value = pair_entropy(chosen_logps_norm, rejected_logps_norm).item()
+                
                 loss_sum += gpt_loss.item()
                 logs_dict = {
                     "gpt_loss": gpt_loss.item(),
                     "lr": self.scheduler.get_last_lr()[0],
                     "grad_norm": self.strategy.get_grad_norm(self.model),
+                    "pair_entropy": pair_entropy_value,
+                    "chosen_entropy": chosen_entropy_value,
+                    "rejected_entropy": reject_entropy_value,
                 }
                 if self.aux_loss:
                     logs_dict["aux_loss"] = aux_loss.item()
@@ -255,18 +320,24 @@ class SFTTrainer(ABC):
             )
 
             device = next(self.model.parameters()).device
-            for inputs, attention_masks, loss_masks in eval_dataloader:
-                inputs = inputs.to(device).squeeze(1)
-                attention_mask = attention_masks.to(device).squeeze(1)
-                loss_mask = loss_masks.to(device).squeeze(1)
+            for data in eval_dataloader:
+                chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens = data
+                chosen_ids = chosen_ids.squeeze(1).to(device)
+                c_mask = c_mask.squeeze(1).to(device)
+
                 per_token_log_probs = self.model(
-                    inputs,
-                    attention_mask=attention_mask,
+                    chosen_ids,
+                    attention_mask=c_mask,
                     return_logprobs=True,
                     ring_attn_group=self.strategy.ring_attn_group,
                 )
 
-                loss = self.loss_fn(per_token_log_probs, loss_mask[:, :-1])
+                chosen_resp_mask = c_mask.clone().bool()
+                for i, p_len in enumerate(prompt_id_lens):
+                    chosen_resp_mask[i, :p_len] = False
+                chosen_shifted_mask = chosen_resp_mask[:, 1:]
+
+                loss = self.loss_fn(per_token_log_probs, chosen_shifted_mask)
 
                 times += 1
                 loss_sum += loss.item()
@@ -283,3 +354,59 @@ class SFTTrainer(ABC):
                     for k, v in logs.items():
                         self._tensorboard.add_scalar(f"eval/{k}", v, steps)
         self.model.train()  # reset model state
+
+    def concatenated_inputs(self, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens):
+        """Concatenate the chosen and rejected inputs into a single tensor.
+
+        Args:
+            batch: A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors of shape (batch_size, sequence_length).
+
+        Returns:
+            A dictionary containing the concatenated inputs under the key 'concatenated_input_ids'.
+        """
+
+        def pad_to_length(tensor, length, pad_value, dim=-1):
+            if tensor.size(dim) >= length:
+                return tensor
+            else:
+                pad_size = list(tensor.shape)
+                pad_size[dim] = length - tensor.size(dim)
+                return torch.cat(
+                    [tensor, pad_value * torch.ones(*pad_size, dtype=tensor.dtype, device=tensor.device)], dim=dim
+                )
+
+        max_length = max(chosen_ids.shape[1], reject_ids.shape[1])
+        inputs_ids = torch.cat(
+            (
+                pad_to_length(chosen_ids, max_length, self.tokenizer.pad_token_id),
+                pad_to_length(reject_ids, max_length, self.tokenizer.pad_token_id),
+            ),
+            dim=0,
+        )
+        max_length = max(c_mask.shape[1], r_mask.shape[1])
+        att_masks = torch.cat((pad_to_length(c_mask, max_length, 0), pad_to_length(r_mask, max_length, 0)), dim=0)
+        return inputs_ids, att_masks, prompt_id_lens * 2
+
+    def _get_batch_logps(
+        self,
+        per_token_logps: torch.FloatTensor,
+        attention_mask,
+        prompt_id_lens,
+    ) -> torch.FloatTensor:
+        """Compute the summed and averaged log probabilities of the given labels under the given logits.
+
+        Args:
+            per_token_logps: Per token log probabilities. Shape: (batch_size, sequence_length)
+
+        Returns:
+            (sum, mean) tensors of shape (batch_size,) over the non-masked tokens.
+        """
+        loss_masks = attention_mask.clone().bool()
+        # mask prompts
+        for mask, source_len in zip(loss_masks, prompt_id_lens):
+            mask[:source_len] = False
+        loss_masks = loss_masks[:, 1:]
+
+        logprobs_sums = (per_token_logps * loss_masks).sum(-1)
+        logprobs_means = logprobs_sums / loss_masks.sum(-1)
+        return logprobs_sums, logprobs_means
