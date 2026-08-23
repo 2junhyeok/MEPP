@@ -8,6 +8,7 @@ from tqdm import tqdm
 from openrlhf.models import DPOLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
 from openrlhf.utils.utils import pair_entropy
+from openrlhf.utils.utils import masked_mean
 
 
 class DPOTrainer(ABC):
@@ -154,14 +155,15 @@ class DPOTrainer(ABC):
                 c_mask = c_mask.squeeze(1).to(device)
                 reject_ids = reject_ids.squeeze(1).to(device)
                 r_mask = r_mask.squeeze(1).to(device)
-
-                chosen_logps, rejected_logps, aux_loss, nll_loss = self.concatenated_forward(
-                    self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
-                )
+                
                 with torch.no_grad():
                     reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
-                        self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
+                        self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=False
                     )
+                chosen_logps, rejected_logps, aux_loss, nll_loss, chosen_entropy, rejected_entropy = self.concatenated_forward(
+                    self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=True
+                )
+
 
                 # loss function
                 preference_loss, chosen_reward, reject_reward = self.loss_fn(
@@ -187,6 +189,7 @@ class DPOTrainer(ABC):
                 loss_sum += preference_loss.item()
                 # dpo logs
                 
+                # pair entropy
                 prompt_lens_tensor = torch.tensor(prompt_id_lens, device = c_mask.device)
                 
                 chosen_len = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
@@ -206,6 +209,8 @@ class DPOTrainer(ABC):
                     "lr": self.scheduler.get_last_lr()[0],
                     "grad_norm": self.strategy.get_grad_norm(self.model),
                     "pair_entropy": pair_entropy_value,
+                    "chosen_entropy": chosen_entropy,
+                    "rejected_entropy": rejected_entropy
                 }
                 if self.nll_loss:
                     logs_dict["nll_loss"] = nll_loss.item()
@@ -283,14 +288,15 @@ class DPOTrainer(ABC):
                 c_mask = c_mask.squeeze(1).to(device)
                 reject_ids = reject_ids.squeeze(1).to(device)
                 r_mask = r_mask.squeeze(1).to(device)
-
-                chosen_logps, rejected_logps, aux_loss, _ = self.concatenated_forward(
-                    self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
-                )
+                
                 with torch.no_grad():
                     reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
-                        self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
+                        self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=False
                     )
+                chosen_logps, rejected_logps, aux_loss, _, _, _ = self.concatenated_forward(
+                    self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=True
+                )
+
 
                 loss, chosen_reward, reject_reward = self.loss_fn(
                     chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
@@ -316,7 +322,7 @@ class DPOTrainer(ABC):
                         self._tensorboard.add_scalar(f"eval/{k}", v, steps)
         self.model.train()  # reset model state
 
-    def concatenated_forward(self, model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens):
+    def concatenated_forward(self, model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=True):
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
         We do this to avoid doing two forward passes, because it's faster for FSDP.
@@ -330,15 +336,37 @@ class DPOTrainer(ABC):
             attention_mask=att_masks,
             return_output=True,
             return_logprobs=True,
+            return_entropy = return_entropy, # for token entropy
             ring_attn_group=self.strategy.ring_attn_group,
         )
-
+        
         all_logps_sum, all_logps_mean = self._get_batch_logps(log_probs, att_masks, prompt_id_lens)
         chosen_logps = all_logps_sum[: chosen_ids.shape[0]]
         rejected_logps = all_logps_sum[chosen_ids.shape[0] :]
         aux_loss = output.aux_loss if "aux_loss" in output else []
-        return chosen_logps, rejected_logps, aux_loss, -all_logps_mean[: chosen_ids.shape[0]].mean()
+        if hasattr(output, "logits"):
+            del output.logits
+        # token entropy
+        if hasattr(output, "entropy") and output.entropy is not None:
+            output_entropy = output.entropy# output.entropy [2B, seq_len -1]
+            c_resp_mask = att_masks[:chosen_ids.shape[0]].clone()
+            r_resp_mask = att_masks[chosen_ids.shape[0]:].clone()
+            c_prompt_lens = prompt_id_lens[:chosen_ids.shape[0]]
+            r_prompt_lens = prompt_id_lens[chosen_ids.shape[0]:]
+            for i, p_len in enumerate(c_prompt_lens):
+                c_resp_mask[i, :p_len] = 0
 
+            for i, p_len in enumerate(r_prompt_lens):
+                r_resp_mask[i, :p_len] = 0
+                
+            c_resp_mask = c_resp_mask[:, 1:]
+            r_resp_mask = r_resp_mask[:, 1:]
+            
+            chosen_entropy = masked_mean(output_entropy[:chosen_ids.shape[0]], c_resp_mask).detach()
+            rejected_entropy = masked_mean(output_entropy[chosen_ids.shape[0]:], r_resp_mask).detach()     
+        
+            return chosen_logps, rejected_logps, aux_loss, -all_logps_mean[: chosen_ids.shape[0]].mean(), chosen_entropy, rejected_entropy
+        return chosen_logps, rejected_logps, aux_loss, -all_logps_mean[: chosen_ids.shape[0]].mean()
     def concatenated_inputs(self, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens):
         """Concatenate the chosen and rejected inputs into a single tensor.
 

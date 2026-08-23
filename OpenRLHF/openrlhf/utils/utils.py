@@ -131,3 +131,14 @@ def pair_entropy(chosen_logps_norm, rejected_logps_norm, eps=1e-8):
     h = -(q * torch.log(q) + (1 - q) * torch.log(1 - q)) # h(q) = -qlogq -(1-q)log(1-q)
     return h.mean()
 
+def masked_mean(tensor, mask, dim=None):
+    """
+    Args:
+        tensor shape (output.entropy): [batch_size, seq_len - 1]
+        mask shape: [batch_size, seq_len - 1]
+    Returns:
+        mean of masked tokens
+    """ 
+    mask = mask.to(tensor.dtype)
+    masked_mean = (tensor * mask).sum(dim=dim) / mask.sum(dim=dim).clamp(min=1e-8)
+    return masked_mean

@@ -16,12 +16,14 @@ deepspeed --num_gpus 8 --module openrlhf.cli.train_dpo \
   --train.max_epochs 3 \
   --model.model_name_or_path Qwen/Qwen2.5-Math-1.5B \
   --ckpt.output_dir ./ckpt/openrlhf_dpo/dpo_ckpt \
-  --ckpt.save_steps 500 \
+  --ckpt.save_steps 300 \
+  --ckpt.max_num 20 \
   --ckpt.save_hf \
   --logger.logging_steps 1 \
+  --logger.wandb.key "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" \
   --logger.wandb.project "openr1-comparison" \
   --logger.wandb.run_name "qwen2.5-math-1.5b-dpo" \
-  --eval.steps 50 \
+  --eval.steps 100 \
   --ds.zero_stage 2 \
   --ds.param_dtype bf16 \
   --ds.attn_implementation flash_attention_2 \
