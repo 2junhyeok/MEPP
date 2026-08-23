@@ -362,8 +362,8 @@ class DPOTrainer(ABC):
             c_resp_mask = c_resp_mask[:, 1:]
             r_resp_mask = r_resp_mask[:, 1:]
             
-            chosen_entropy = masked_mean(output_entropy[:chosen_ids.shape[0]], c_resp_mask).detach()
-            rejected_entropy = masked_mean(output_entropy[chosen_ids.shape[0]:], r_resp_mask).detach()     
+            chosen_entropy = masked_mean(output_entropy[:chosen_ids.shape[0]], c_resp_mask).detach().item()
+            rejected_entropy = masked_mean(output_entropy[chosen_ids.shape[0]:], r_resp_mask).detach().item()   
         
             return chosen_logps, rejected_logps, aux_loss, -all_logps_mean[: chosen_ids.shape[0]].mean(), chosen_entropy, rejected_entropy
         return chosen_logps, rejected_logps, aux_loss, -all_logps_mean[: chosen_ids.shape[0]].mean()
