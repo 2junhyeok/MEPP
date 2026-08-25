@@ -338,49 +338,61 @@ class MEPPLoss(nn.Module):
     """
     MEPLoss
     """
-    def __init__(self, rho: float, score_mode: list, reduction: list):
+    def __init__(self, rho: float, score_mode: str = "mean", reduction: str = "mean"):
         super().__init__()
-        score_mode = ["sum", "mean"]
-        reduction = ["sum", "mean", "none"]
-        
+        if not (0.5 < rho < 1.0):
+            raise ValueError(f"rho must be in (0.5, 1), got {rho}.")
+        if score_mode not in ("sum", "mean"):
+            raise ValueError(f"score_mode must be one of ('sum', 'mean'), got {score_mode!r}.")
+        if reduction not in ("sum", "mean", "none"):
+            raise ValueError(f"reduction must be one of ('sum', 'mean', 'none'), got {reduction!r}.")
+        self.rho = rho
+        self.score_mode = score_mode
+        self.reduction = reduction
+ 
     def forward(
         self,
         policy_chosen_logps: torch.Tensor,
         policy_rejected_logps: torch.Tensor,
         reference_chosen_logps: torch.Tensor,
         reference_rejected_logps: torch.Tensor,
-        rho: float,
-        score_mode,
-        reduction
-        ):
-        logp_chosen, logp_rejected = normalize_scores(
-            policy_chosen_logps,
-            policy_rejected_logps,
-            chosen_lengths,
-            rejected_lengths,
-            score_mode,
-        )
-        ref_logp_chosen, ref_logp_rejected = normalize_scores(
-            reference_chosen_logps,
-            reference_rejected_logps,
-            chosen_lengths,
-            rejected_lengths,
-            score_mode,
-        )
-        d_theta = policy_chosen_logps - policy_rejected_logps
-        d_theta_fp32 = d_theta.float()#.clamp(-100, 100)
+        chosen_lengths: torch.Tensor = None,
+        rejected_lengths: torch.Tensor = None,
+        reduction: str = None,
+    ):
+        reduction = reduction or self.reduction
+ 
+        # length-normalize (or not), depending on score_mode
+        logp_chosen, logp_rejected = normalize_score(policy_chosen_logps,
+                                                                     policy_rejected_logps,
+                                                                     chosen_lengths,
+                                                                     rejected_lengths,
+                                                                     self.score_mode)
+        ref_logp_chosen, ref_logp_rejected = normalize_score(reference_chosen_logps,
+                                                               reference_rejected_logps,
+                                                               chosen_lengths,
+                                                               rejected_lengths,
+                                                               self.score_mode)
+ 
+        # how much each response's score moved relative to the reference model
+        # (this plays the role of DPO's implicit per-response reward, without a beta scale)
+        chosen_score_shift = logp_chosen - ref_logp_chosen
+        rejected_score_shift = logp_rejected - ref_logp_rejected
+        score_shift_gap = chosen_score_shift - rejected_score_shift
+
+        d_theta = logp_chosen - logp_rejected# score gap
+        d_theta_fp32 = d_theta.float()
+        q_theta = torch.sigmoid(d_theta)
         
-        d_0 = (reference_chosen_logps - reference_rejected_logps).detach()
+        d_0 = ref_logp_chosen - ref_logp_rejected
         d_0_fp32 = d_0.float()
-        
         q_0 = torch.sigmoid(d_0_fp32)
-        
-        rho_tensor = torch.full_like(q_0, rho)#? 
-        q_star = torch.max(q_0, rho_tensor).detach()
-        q_theta = torch.sigmoid(d_theta_fp32)
-        
-        per_example_loss = binary_cross_entropy_with_logits(d_theta_fp32, q_star, reduction="none")
-        
+
+        rho_tensor = torch.full_like(q_0, self.rho)
+        q_star = torch.maximum(q_0, rho_tensor).detach()
+ 
+        per_example_loss = F.binary_cross_entropy_with_logits(d_theta_fp32, q_star, reduction="none")
+ 
         if reduction == "none":
             loss = per_example_loss
         elif reduction == "mean":
@@ -389,7 +401,31 @@ class MEPPLoss(nn.Module):
             loss = per_example_loss.sum()
         else:
             raise ValueError(f"Unknown reduction={reduction!r}.")
-        
-        pair_entropy = binary_entropy(q_theta)
-        
-        return loss, q_theta, pair_entropy
+
+        residual = (q_star - q_theta).detach()
+        pair_entropy_value = binary_entropy(q_theta)
+ 
+        metrics = {
+            "chosen_rewards": chosen_score_shift.detach(),
+            "reject_rewards": rejected_score_shift.detach(),
+            "pair_entropy": pair_entropy_value.detach().float().mean().item(),
+            "mepp": {
+                "q_theta": q_theta.detach().float().mean().item(),
+                "q_0": q_0.detach().float().mean().item(),
+                "q_star": q_star.detach().float().mean().item(),
+                "residual": residual.float().mean().item(),
+                "abs_residual": residual.float().abs().mean().item(),# abs
+                "target_at_rho_frac": (q_star <= self.rho + 1e-6).float().mean().item(),
+                "already_adq_frac": (q_0 >= self.rho).float().mean().item(),
+                "preference_acc": (q_theta > 0.5).float().mean().item(),
+                "score_shift_gap": score_shift_gap.detach().float().mean().item(),
+
+                "score_shift_acc": (score_shift_gap.detach() > 0).float().mean().item(),
+            },
+            "logps": {
+                "chosen": policy_chosen_logps.detach().float().mean().item(),
+                "rejected": policy_rejected_logps.detach().float().mean().item(),
+            },
+        }
+ 
+        return loss, metrics

@@ -1,36 +1,24 @@
 import os
 from abc import ABC
 
+from typing import Literal
+
 import torch
+import torch.nn.functional as F
 from torch.optim import Optimizer
 from tqdm import tqdm
 
-from openrlhf.models import DPOLoss
+from openrlhf.models.loss import DPOLoss, MEPPLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
-from openrlhf.utils.utils import pair_entropy
+#from openrlhf.utils.utils import pair_entropy
 from openrlhf.utils.utils import masked_mean
 
-
-class DPOTrainer(ABC):
+class MEPPTrainer(ABC):
     """
-    Trainer for Direct Preference Optimization (DPO) training.
-
+    Trainer for MEPP(Maximum Entropy Preference Projection) training.
+    
     Args:
-        model (torch.nn.Module): The primary model to be trained.
-        ref_model (torch.nn.Module): The reference model for comparing and guiding preference.
-        strategy (Strategy): The strategy to use for training.
-        tokenizer (Tokenizer): The tokenizer for processing input data.
-        optim (Optimizer): The optimizer for training the model.
-        train_dataloader (DataLoader): The dataloader for the training dataset.
-        eval_dataloader (DataLoader): The dataloader for the evaluation dataset.
-        scheduler (Scheduler): The learning rate scheduler to control learning rate during training.
-        max_norm (float, defaults to 0.5): Maximum gradient norm for gradient clipping.
-        beta (float, defaults to 0.01): Coefficient for regularizing the preference loss.
-        max_epochs (int, defaults to 2): Maximum number of training epochs.
-        save_hf_ckpt (bool): Whether to save huggingface-format model weight.
-        disable_ds_ckpt (bool): Whether not to save deepspeed-format model weight. (Deepspeed model weight is used for training recovery)
     """
-
     def __init__(
         self,
         model,
@@ -41,9 +29,8 @@ class DPOTrainer(ABC):
         train_dataloader,
         eval_dataloader,
         scheduler,
-        max_norm=0.5,
-        beta=0.01,
-        max_epochs: int = 2,
+        max_norm: float = 0.5,
+        max_epochs: int = 3,
         save_hf_ckpt: bool = False,
         disable_ds_ckpt: bool = False,
     ) -> None:
@@ -61,10 +48,11 @@ class DPOTrainer(ABC):
         self.args = strategy.args
         self.save_hf_ckpt = save_hf_ckpt
         self.disable_ds_ckpt = disable_ds_ckpt
-
-        self.beta = beta
-        self.loss_fn = DPOLoss(self.beta, self.args.model.label_smoothing, self.args.model.ipo_enable)
-
+        self.loss_fn = MEPPLoss(
+            rho=self.args.model.rho,
+            score_mode=self.args.model.score_mode,
+            reduction=self.args.model.reduction,
+        )
         # Mixtral 8*7b
         self.aux_loss = self.args.model.aux_loss_coef > 1e-8
 
@@ -73,7 +61,6 @@ class DPOTrainer(ABC):
 
         # packing samples
         self.packing_samples = strategy.args.ds.packing_samples
-
         # wandb/tensorboard setting
         self._wandb = None
         self._tensorboard = None
@@ -104,7 +91,7 @@ class DPOTrainer(ABC):
             os.makedirs(self.strategy.args.logger.tensorboard_dir, exist_ok=True)
             log_dir = os.path.join(self.strategy.args.logger.tensorboard_dir, strategy.args.logger.wandb.run_name)
             self._tensorboard = SummaryWriter(log_dir=log_dir)
-
+    
     def fit(self, args, consumed_samples=0, num_update_steps_per_epoch=None):
         # Infer num_update_steps_per_epoch from dataloader if not provided
         if num_update_steps_per_epoch is None:
@@ -133,6 +120,7 @@ class DPOTrainer(ABC):
         )
         acc_sum = 0
         loss_sum = 0
+        
         for epoch in range(start_epoch, self.epochs):
             if isinstance(self.train_dataloader.sampler, DistributedSampler):
                 self.train_dataloader.sampler.set_epoch(
@@ -148,7 +136,8 @@ class DPOTrainer(ABC):
             self.model.train()
             self.ref_model.eval()
             device = next(self.model.parameters()).device
-            # train
+            
+            #train
             for data in self.train_dataloader:
                 chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens = data
                 chosen_ids = chosen_ids.squeeze(1).to(device)
@@ -160,58 +149,68 @@ class DPOTrainer(ABC):
                     reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
                         self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=False
                     )
-                chosen_logps, rejected_logps, aux_loss, nll_loss, chosen_entropy, rejected_entropy = self.concatenated_forward(
+                policy_chosen_logps, policy_rejected_logps, aux_loss, nll_loss, chosen_entropy, rejected_entropy = self.concatenated_forward(
                     self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=True
                 )
 
-
+                # for pair entropy
+                prompt_lens_tensor = torch.tensor(prompt_id_lens, device=c_mask.device)
+                chosen_lengths = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+                rejected_lengths = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+                
                 # loss function
-                preference_loss, chosen_reward, reject_reward = self.loss_fn(
-                    chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
+                loss, metrics = self.loss_fn(
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    reference_chosen_logps,
+                    reference_rejected_logps,
+                    chosen_lengths=chosen_lengths,
+                    rejected_lengths=rejected_lengths,
+                    reduction="mean",
                 )
+                
+                chosen_rewards = metrics["chosen_rewards"]
+                reject_rewards = metrics["reject_rewards"]
+                
+                pair_entropy = metrics["pair_entropy"]
                 # mixtral
                 if not self.aux_loss:
                     aux_loss = 0
                 # nll loss
                 if not self.nll_loss:
                     nll_loss = 0
-
+                
                 loss = (
-                    preference_loss
+                    loss
                     + aux_loss * self.args.model.aux_loss_coef
                     + nll_loss * self.args.model.nll_loss_coef
                 )
                 self.strategy.backward(loss, self.model, self.optimizer)
                 self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
 
-                acc = (chosen_reward > reject_reward).float().mean().item()
+                acc = (chosen_rewards > reject_rewards).float().mean().item()
                 acc_sum += acc
-                loss_sum += preference_loss.item()
-                # dpo logs
-                
-                # pair entropy
-                prompt_lens_tensor = torch.tensor(prompt_id_lens, device = c_mask.device)
-                
-                chosen_len = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
-                rejected_len = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+                loss_sum += loss.item()
 
                 # length normalization
-                chosen_logps_norm = chosen_logps / chosen_len
-                rejected_logps_norm = rejected_logps / rejected_len
-                
-                pair_entropy_value = pair_entropy(chosen_logps_norm, rejected_logps_norm).item()
+                #policy_chosen_logps_norm = policy_chosen_logps / chosen_lengths
+                #policy_rejected_logps_norm = policy_rejected_logps / rejected_lengths
+                #pair_entropy_value = pair_entropy(policy_chosen_logps_norm, policy_rejected_logps_norm).item()
                 
                 logs_dict = {
-                    "loss": preference_loss.item(),
+                    "loss": loss.item(),
                     "acc": acc,
-                    "chosen_reward": chosen_reward.mean().item(),
-                    "reject_reward": reject_reward.mean().item(),
+                    "chosen_reward": chosen_rewards.float().mean().item(),
+                    "reject_reward": reject_rewards.float().mean().item(),
                     "lr": self.scheduler.get_last_lr()[0],
                     "grad_norm": self.strategy.get_grad_norm(self.model),
-                    "pair_entropy": pair_entropy_value,
+                    "pair_entropy": pair_entropy,
                     "chosen_entropy": chosen_entropy,
                     "rejected_entropy": rejected_entropy
                 }
+                logs_dict.update({f"mepp/{k}": v for k, v in metrics["mepp"].items()})
+                logs_dict.update({f"logps/{k}": v for k, v in metrics["logps"].items()})
+                
                 if self.nll_loss:
                     logs_dict["nll_loss"] = nll_loss.item()
                 # step bar
@@ -289,23 +288,27 @@ class DPOTrainer(ABC):
                 reject_ids = reject_ids.squeeze(1).to(device)
                 r_mask = r_mask.squeeze(1).to(device)
                 
-                with torch.no_grad():
-                    reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
-                        self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=False
-                    )
-                chosen_logps, rejected_logps, aux_loss, _, _, _ = self.concatenated_forward(
-                    self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=True
+                prompt_lens_tensor = torch.tensor(prompt_id_lens, device=c_mask.device)
+                chosen_lengths = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+                rejected_len = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
+ 
+                loss, metrics = self.loss_fn(
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    reference_chosen_logps,
+                    reference_rejected_logps,
+                    chosen_lengths=chosen_lengths,
+                    rejected_lengths=rejected_len,
+                    reduction="mean",
                 )
-
-
-                loss, chosen_reward, reject_reward = self.loss_fn(
-                    chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
-                )
+                chosen_reward = metrics["chosen_reward"]
+                reject_reward = metrics["reject_reward"]
+ 
                 acc_sum += (chosen_reward > reject_reward).float().mean().item()
                 loss_sum += loss.item()
                 times += 1
                 step_bar.update()
-
+ 
             logs = {
                 "eval_loss": loss_sum / times,
                 "acc_mean": acc_sum / times,
