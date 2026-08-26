@@ -173,7 +173,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt.disable_ds", action="store_true", default=False)
     parser.add_argument("--logger.logging_steps", type=int, default=1)
     parser.add_argument("--eval.steps", type=int, default=-1)
-    parser.add_argument("--ckpt.path", type=str, default="./ckpt/checkpoints_dpo")
+    parser.add_argument("--ckpt.path", type=str, default="./ckpt/checkpoints_mepp")
     parser.add_argument("--ckpt.max_num", type=int, default=3)
     parser.add_argument("--ckpt.max_mem", type=int, default=int(1e8))
     parser.add_argument("--ds.use_universal_ckpt", action="store_true", default=False)
@@ -337,7 +337,7 @@ if __name__ == "__main__":
     parser.add_argument("--logger.wandb.key", type=str, default=None)
     parser.add_argument("--logger.wandb.org", type=str, default=None)
     parser.add_argument("--logger.wandb.group", type=str, default=None)
-    parser.add_argument("--logger.wandb.project", type=str, default="openrlhf_train_dpo")
+    parser.add_argument("--logger.wandb.project", type=str, default="openrlhf_train_mepp")
     parser.add_argument(
         "--logger.wandb.run_name",
         type=str,

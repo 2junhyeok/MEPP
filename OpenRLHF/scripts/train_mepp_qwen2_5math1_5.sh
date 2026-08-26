@@ -3,7 +3,6 @@ export CUDA_HOME=$CONDA_PREFIX
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
-
 deepspeed --num_gpus 8 --module openrlhf.cli.train_mepp \
   --data.dataset ~/ljh/MEPP/data/openr1_dpo \
   --data.chosen_key chosen \
