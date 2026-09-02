@@ -158,6 +158,13 @@ def train(args):
         save_hf_ckpt=args.ckpt.save_hf,
         disable_ds_ckpt=args.ckpt.disable_ds,
     )
+    strategy.print(f"eval.dataset = {args.eval.dataset}")
+    strategy.print(f"eval.split = {args.eval.split}")
+    strategy.print(f"eval.steps = {args.eval.steps}")
+    strategy.print(
+        f"eval_dataloader len = "
+        f"{len(eval_dataloader) if eval_dataloader is not None else None}"
+    )
     trainer.fit(args, consumed_samples, num_update_steps_per_epoch)
  
     # save model checkpoint after fitting on only rank0

@@ -271,15 +271,15 @@ class MEPPTrainer(ABC):
 
     def evaluate(self, eval_dataloader, steps=0):
         self.model.eval()
+        self.ref_model.eval()
         with torch.no_grad():
             step_bar = tqdm(
                 range(eval_dataloader.__len__()),
                 desc="Eval stage of global_step %d" % steps,
                 disable=not self.strategy.is_rank_0(),
             )
-            acc_sum = 0
-            loss_sum = 0
             times = 0
+            logs_sum = {}
             device = next(self.model.parameters()).device
             for data in eval_dataloader:
                 chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens = data
@@ -287,11 +287,42 @@ class MEPPTrainer(ABC):
                 c_mask = c_mask.squeeze(1).to(device)
                 reject_ids = reject_ids.squeeze(1).to(device)
                 r_mask = r_mask.squeeze(1).to(device)
-                
+                # reference forward
+                (
+                    reference_chosen_logps,
+                    reference_rejected_logps,
+                    _,_,
+                ) = self.concatenated_forward(
+                    self.ref_model,
+                    chosen_ids,
+                    c_mask,
+                    reject_ids,
+                    r_mask,
+                    prompt_id_lens,
+                    return_entropy=False,
+                )
+                # policy forward
+                (
+                    policy_chosen_logps,
+                    policy_rejected_logps,
+                    aux_loss,
+                    nll_loss,
+                    chosen_entropy,
+                    rejected_entropy,
+                ) = self.concatenated_forward(
+                    self.model,
+                    chosen_ids,
+                    c_mask,
+                    reject_ids,
+                    r_mask,
+                    prompt_id_lens,
+                    return_entropy=True,
+                )
+                # response length
                 prompt_lens_tensor = torch.tensor(prompt_id_lens, device=c_mask.device)
                 chosen_lengths = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
                 rejected_len = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
- 
+                # MEPP loss
                 loss, metrics = self.loss_fn(
                     policy_chosen_logps,
                     policy_rejected_logps,
@@ -301,25 +332,58 @@ class MEPPTrainer(ABC):
                     rejected_lengths=rejected_len,
                     reduction="mean",
                 )
-                chosen_reward = metrics["chosen_reward"]
-                reject_reward = metrics["reject_reward"]
- 
-                acc_sum += (chosen_reward > reject_reward).float().mean().item()
-                loss_sum += loss.item()
+                chosen_rewards = metrics["chosen_rewards"]
+                reject_rewards = metrics["reject_rewards"]
+                pair_entropy = metrics["pair_entropy"]
+
+                if not self.aux_loss:
+                    aux_loss = 0
+                if not self.nll_loss:
+                    nll_loss = 0
+                loss =(
+                    loss
+                    + aux_loss * self.args.model.aux_loss_coef
+                    + nll_loss * self.args.model.nll_loss_coef
+                )
+                
+                acc = (
+                    (chosen_rewards > reject_rewards).float().mean().item()
+                )
+                logs_dict = {
+                    "loss": loss.item(),
+                    "acc": acc,
+                    "chosen_reward": chosen_rewards.float().mean().item(),
+                    "reject_reward": reject_rewards.float().mean().item(),
+                    "pair_entropy": pair_entropy,
+                    "chosen_entropy": chosen_entropy,
+                    "rejected_entropy": rejected_entropy,
+                }
+                logs_dict.update({f"mepp/{k}": v for k, v in metrics["mepp"].items()})
+                logs_dict.update({f"logps/{k}": v for k, v in metrics["logps"].items()})
+                if self.nll_loss:
+                    logs_dict["nll_loss"] = nll_loss.item()
+                
+                logs_dict = self.strategy.all_reduce(logs_dict)
+                for k, v in logs_dict.items():
+                    logs_sum[k] = logs_sum.get(k, 0.0) + v
+                
                 times += 1
+                step_bar.set_postfix(logs_dict)
                 step_bar.update()
  
-            logs = {
-                "eval_loss": loss_sum / times,
-                "acc_mean": acc_sum / times,
+            logs_dict = {
+                k: v / times for k, v in logs_sum.items()
             }
-            logs = self.strategy.all_reduce(logs)
-            step_bar.set_postfix(logs)
 
+            logs_dict["loss_mean"] = logs_dict["loss"]
+            logs_dict["acc_mean"] = logs_dict["acc"]
+            
+            step_bar.set_postfix(logs_dict)
+            
             if self.strategy.is_rank_0():
                 if self._wandb is not None:
-                    logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
-                    self._wandb.log(logs)
+                    wandb_logs = {"eval/%s" % k: v for k, v in {**logs_dict, "global_step": steps}.items()}
+                    self._wandb.log(wandb_logs)
                 elif self._tensorboard is not None:
                     for k, v in logs.items():
                         self._tensorboard.add_scalar(f"eval/{k}", v, steps)
