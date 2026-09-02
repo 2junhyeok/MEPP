@@ -313,6 +313,8 @@ class SFTTrainer(ABC):
         self.model.eval()
         with torch.no_grad():
             loss_sum = 0
+            chosen_logps_sum = 0.0
+            rejected_logps_sum = 0.0
             step_bar = tqdm(
                 range(eval_dataloader.__len__()),
                 desc="Eval stage of steps %d" % steps,
@@ -324,6 +326,12 @@ class SFTTrainer(ABC):
                 chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens = data
                 chosen_ids = chosen_ids.squeeze(1).to(device)
                 c_mask = c_mask.squeeze(1).to(device)
+                reject_ids = reject_ids.squeeze(1).to(device)
+                r_mask = r_mask.squeeze(1).to(device)
+                
+                input_ids, attention_mask, doubled_prompt_lens = self.concatenated_inputs(
+                    chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens
+                )
 
                 per_token_log_probs = self.model(
                     chosen_ids,
@@ -331,7 +339,9 @@ class SFTTrainer(ABC):
                     return_logprobs=True,
                     ring_attn_group=self.strategy.ring_attn_group,
                 )
-
+                B = chosen_ids.shape[0]
+                chosen_log_probs = per_token_log_probs[:B]
+                
                 chosen_resp_mask = c_mask.clone().bool()
                 for i, p_len in enumerate(prompt_id_lens):
                     chosen_resp_mask[i, :p_len] = False
@@ -339,9 +349,17 @@ class SFTTrainer(ABC):
 
                 loss = self.loss_fn(per_token_log_probs, chosen_shifted_mask)
 
+                all_logps_sum, _ = self._get_batch_logps(per_token_log_probs, attention_mask, doubled_prompt_lens)
+                chosen_logps = all_logps_sum[:B]
+                rejected_logps = all_logps_sum[B:]
+                
                 times += 1
                 loss_sum += loss.item()
-                bar_dict = {"eval gpt_loss": loss_sum / times}
+                bar_dict = {
+                    "eval gpt_loss": loss_sum / times,
+                    "logps/chosen": chosen_logps_sum / times,
+                    "logps/rejected": rejected_logps_sum / times,
+                    }
                 step_bar.update()
                 logs = self.strategy.all_reduce(bar_dict)
                 step_bar.set_postfix(logs)

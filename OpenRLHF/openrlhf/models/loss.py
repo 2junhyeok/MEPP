@@ -332,7 +332,13 @@ class DPOLoss(nn.Module):
         chosen_rewards = self.beta * (policy_chosen_logps - reference_chosen_logps).detach()
         rejected_rewards = self.beta * (policy_rejected_logps - reference_rejected_logps).detach()
 
-        return loss, chosen_rewards, rejected_rewards
+        metrics = {
+            "logps": {
+                "chosen": policy_chosen_logps.detach().float().mean().item(),
+                "rejected": policy_rejected_logps.detach().float().mean().item(),
+            },
+        }
+        return loss, chosen_rewards, rejected_rewards, metrics
 
 class MEPPLoss(nn.Module):
     """

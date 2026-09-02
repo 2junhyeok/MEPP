@@ -166,7 +166,7 @@ class DPOTrainer(ABC):
 
 
                 # loss function
-                preference_loss, chosen_reward, reject_reward = self.loss_fn(
+                preference_loss, chosen_reward, reject_reward, metrics = self.loss_fn(
                     chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
                 )
                 # mixtral
@@ -204,14 +204,15 @@ class DPOTrainer(ABC):
                 logs_dict = {
                     "loss": preference_loss.item(),
                     "acc": acc,
-                    "chosen_reward": chosen_reward.mean().item(),
-                    "reject_reward": reject_reward.mean().item(),
+                    "chosen_reward": chosen_reward.mean().item() / self.beta, # to match MEPP
+                    "reject_reward": reject_reward.mean().item() / self.beta, # to match MEPP
                     "lr": self.scheduler.get_last_lr()[0],
                     "grad_norm": self.strategy.get_grad_norm(self.model),
                     "pair_entropy": pair_entropy_value,
                     "chosen_entropy": chosen_entropy,
                     "rejected_entropy": rejected_entropy
                 }
+                logs_dict.update({f"logps/{k}": v for k, v in metrics["logps"].items()})
                 if self.nll_loss:
                     logs_dict["nll_loss"] = nll_loss.item()
                 # step bar
@@ -280,6 +281,8 @@ class DPOTrainer(ABC):
             )
             acc_sum = 0
             loss_sum = 0
+            chosen_logps_sum=0.0
+            rejected_logps_sum=0.0
             times = 0
             device = next(self.model.parameters()).device
             for data in eval_dataloader:
@@ -296,19 +299,21 @@ class DPOTrainer(ABC):
                 chosen_logps, rejected_logps, aux_loss, _, _, _ = self.concatenated_forward(
                     self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=True
                 )
-
-
-                loss, chosen_reward, reject_reward = self.loss_fn(
+                loss, chosen_reward, reject_reward, metrics = self.loss_fn(
                     chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
                 )
                 acc_sum += (chosen_reward > reject_reward).float().mean().item()
                 loss_sum += loss.item()
+                chosen_logps_sum += metrics["logps"]["chosen"]
+                rejected_logps_sum += metrics["logps"]["rejected"]
                 times += 1
                 step_bar.update()
 
             logs = {
                 "eval_loss": loss_sum / times,
                 "acc_mean": acc_sum / times,
+                "logps/chosen": chosen_logps_sum / times,
+                "logps/rejected": rejected_logps_sum / times,                
             }
             logs = self.strategy.all_reduce(logs)
             step_bar.set_postfix(logs)
