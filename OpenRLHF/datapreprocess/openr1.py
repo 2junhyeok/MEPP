@@ -35,6 +35,10 @@ if __name__ == "__main__":
         type=int,
         default=8192,
     )
+    parser.add_argument(
+        "--model",
+        default="Qwen/Qwen2.5-Math-1.5B"
+    )
 
     args = parser.parse_args()
     local_dataset_path = args.local_dataset_path
@@ -104,7 +108,7 @@ if __name__ == "__main__":
 
         return process_fn
 
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B")
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     MAX_LEN = args.max_len
 
     def is_short_enough(example):
