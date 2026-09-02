@@ -340,7 +340,7 @@ class MEPPLoss(nn.Module):
     """
     def __init__(self, rho: float, score_mode: str = "mean", reduction: str = "mean"):
         super().__init__()
-        if not (0.5 < rho < 1.0):
+        if not (0.5 <= rho < 1.0):
             raise ValueError(f"rho must be in (0.5, 1), got {rho}.")
         if score_mode not in ("sum", "mean"):
             raise ValueError(f"score_mode must be one of ('sum', 'mean'), got {score_mode!r}.")
