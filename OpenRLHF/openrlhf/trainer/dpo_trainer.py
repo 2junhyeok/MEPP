@@ -204,8 +204,8 @@ class DPOTrainer(ABC):
                 logs_dict = {
                     "loss": preference_loss.item(),
                     "acc": acc,
-                    "chosen_reward": chosen_reward.mean().item() / self.beta, # to match MEPP
-                    "reject_reward": reject_reward.mean().item() / self.beta, # to match MEPP
+                    "chosen_reward": chosen_reward.mean().item() #/ self.beta # to match MEPP
+                    "reject_reward": reject_reward.mean().item() #/ self.beta # to match MEPP
                     "lr": self.scheduler.get_last_lr()[0],
                     "grad_norm": self.strategy.get_grad_norm(self.model),
                     "pair_entropy": pair_entropy_value,
