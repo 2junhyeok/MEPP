@@ -7,9 +7,8 @@ from tqdm import tqdm
 
 from openrlhf.models import DPOLoss
 from openrlhf.utils.distributed_sampler import DistributedSampler
-from openrlhf.utils.utils import pair_entropy
+from openrlhf.models.utils import binary_entropy
 from openrlhf.utils.utils import masked_mean
-
 
 class DPOTrainer(ABC):
     """
@@ -164,7 +163,6 @@ class DPOTrainer(ABC):
                     self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=True
                 )
 
-
                 # loss function
                 preference_loss, chosen_reward, reject_reward, metrics = self.loss_fn(
                     chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
@@ -184,31 +182,32 @@ class DPOTrainer(ABC):
                 self.strategy.backward(loss, self.model, self.optimizer)
                 self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
 
+
+                #! for pair entropy
+                prompt_lens_tensor = torch.tensor(prompt_id_lens, device=c_mask.device)
+                chosen_lengths = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1).to(chosen_logps.dtype)
+                rejected_lengths = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1).to(rejected_logps.dtype)
+                
+                logp_chosen = chosen_logps / chosen_lengths
+                logp_rejected = rejected_logps / rejected_lengths
+                d_theta = logp_chosen - logp_rejected # score gap
+                d_theta_fp32 = d_theta.float()
+                q_theta = torch.sigmoid(d_theta_fp32)
+                pair_entropy_value = binary_entropy(q_theta)
+
                 acc = (chosen_reward > reject_reward).float().mean().item()
                 acc_sum += acc
                 loss_sum += preference_loss.item()
-                # dpo logs
-                
-                # pair entropy
-                prompt_lens_tensor = torch.tensor(prompt_id_lens, device = c_mask.device)
-                
-                chosen_len = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
-                rejected_len = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1)
 
-                # length normalization
-                chosen_logps_norm = chosen_logps / chosen_len
-                rejected_logps_norm = rejected_logps / rejected_len
-                
-                pair_entropy_value = pair_entropy(chosen_logps_norm, rejected_logps_norm).item()
-                
                 logs_dict = {
                     "loss": preference_loss.item(),
                     "acc": acc,
-                    "chosen_reward": chosen_reward.mean().item() #/ self.beta # to match MEPP
-                    "reject_reward": reject_reward.mean().item() #/ self.beta # to match MEPP
+                    "chosen_reward": chosen_reward.float().mean().item(), #/ self.beta # to match MEPP
+                    "reject_reward": reject_reward.float().mean().item(), #/ self.beta # to match MEPP
                     "lr": self.scheduler.get_last_lr()[0],
                     "grad_norm": self.strategy.get_grad_norm(self.model),
                     "pair_entropy": pair_entropy_value,
+                    "q_theta": q_theta,
                     "chosen_entropy": chosen_entropy,
                     "rejected_entropy": rejected_entropy
                 }
@@ -281,8 +280,7 @@ class DPOTrainer(ABC):
             )
             acc_sum = 0
             loss_sum = 0
-            chosen_logps_sum=0.0
-            rejected_logps_sum=0.0
+            logs_sum = {}
             times = 0
             device = next(self.model.parameters()).device
             for data in eval_dataloader:
@@ -291,37 +289,66 @@ class DPOTrainer(ABC):
                 c_mask = c_mask.squeeze(1).to(device)
                 reject_ids = reject_ids.squeeze(1).to(device)
                 r_mask = r_mask.squeeze(1).to(device)
-                
-                with torch.no_grad():
-                    reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
-                        self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=False
-                    )
-                chosen_logps, rejected_logps, aux_loss, _, _, _ = self.concatenated_forward(
+
+                reference_chosen_logps, reference_rejected_logps, _, _ = self.concatenated_forward(
+                    self.ref_model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=False
+                )
+                chosen_logps, rejected_logps, aux_loss, nll_loss, chosen_entropy, rejected_entropy = self.concatenated_forward(
                     self.model, chosen_ids, c_mask, reject_ids, r_mask, prompt_id_lens, return_entropy=True
                 )
                 loss, chosen_reward, reject_reward, metrics = self.loss_fn(
                     chosen_logps, rejected_logps, reference_chosen_logps, reference_rejected_logps
                 )
-                acc_sum += (chosen_reward > reject_reward).float().mean().item()
+                acc = (chosen_reward > reject_reward).float().mean().item()
                 loss_sum += loss.item()
-                chosen_logps_sum += metrics["logps"]["chosen"]
-                rejected_logps_sum += metrics["logps"]["rejected"]
+                #! for pair entropy
+                prompt_lens_tensor = torch.tensor(prompt_id_lens, device=c_mask.device)
+                chosen_lengths = (c_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1).to(chosen_scores.dtype)
+                rejected_lengths = (r_mask.float().sum(-1) - prompt_lens_tensor).clamp(min=1).to(rejected_scores.dtype)
+                
+                logp_chosen = chosen_logps / chosen_lengths_calc
+                logp_rejected = reject_logps / rejected_lengths_calc
+                d_theta = logp_chosen - logp_rejected # score gap
+                d_theta_fp32 = d_theta.float()
+                q_theta = torch.sigmoid(d_theta_fp32)
+                pair_entropy_value = binary_entropy(q_theta)
+                
+                logs_dict = {
+                    "loss": loss.item(),
+                    "acc": acc,
+                    "chosen_reward": chosen_reward.float().mean().item(),
+                    "reject_reward": reject_reward.float().mean().item(),
+                    "pair_entropy": pair_entropy_value,
+                    "chosen_entropy": chosen_entropy,
+                    "rejected_entropy": rejected_entropy,
+                    "q_theta": q_theta
+                }
+                logs_dict.update({f"logps/{k}": v for k, v in metrics["logps"].items()})
+                
+                if self.nll_loss:
+                    logs_dict["nll_loss"] = nll_loss.item()
+                
+                logs_dict = self.strategy.all_reduce(logs_dict)
+                for k, v in logs_dict.items():
+                    logs_sum[k] = logs_sum.get(k, 0.0) + v
+
                 times += 1
+                step_bar.set_postfix(logs_dict)
                 step_bar.update()
 
-            logs = {
-                "eval_loss": loss_sum / times,
-                "acc_mean": acc_sum / times,
-                "logps/chosen": chosen_logps_sum / times,
-                "logps/rejected": rejected_logps_sum / times,                
+            logs_dict = {
+                k: v / times for k, v in logs_sum.items()
             }
-            logs = self.strategy.all_reduce(logs)
-            step_bar.set_postfix(logs)
+
+            logs_dict["loss_mean"] = logs_dict["loss"]
+            logs_dict["acc_mean"] = logs_dict["acc"]
+            
+            step_bar.set_postfix(logs_dict)
 
             if self.strategy.is_rank_0():
                 if self._wandb is not None:
-                    logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": steps}.items()}
-                    self._wandb.log(logs)
+                    wandb_logs = {"eval/%s" % k: v for k, v in {**logs_dict, "global_step": steps}.items()}
+                    self._wandb.log(wandb_logs)
                 elif self._tensorboard is not None:
                     for k, v in logs.items():
                         self._tensorboard.add_scalar(f"eval/{k}", v, steps)

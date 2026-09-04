@@ -171,7 +171,6 @@ class MEPPTrainer(ABC):
                 
                 chosen_rewards = metrics["chosen_rewards"]
                 reject_rewards = metrics["reject_rewards"]
-                
                 pair_entropy = metrics["pair_entropy"]
                 # mixtral
                 if not self.aux_loss:

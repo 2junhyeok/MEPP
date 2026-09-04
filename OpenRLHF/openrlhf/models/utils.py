@@ -205,6 +205,6 @@ def normalize_score(
     rejected_lengths_calc = rejected_lengths.to(rejected_scores.device).clamp(min=1).to(rejected_scores.dtype)
     return chosen_scores / chosen_lengths_calc, rejected_scores / rejected_lengths_calc
 
-def binary_entropy(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def binary_entropy(q: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     q_safe = q.float().clamp(eps, 1.0 - eps)
     return -(q_safe * q_safe.log() + (1.0 - q_safe) * (1.0 - q_safe).log())

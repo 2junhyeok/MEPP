@@ -318,7 +318,11 @@ class DPOLoss(nn.Module):
         pi_logratios = policy_chosen_logps - policy_rejected_logps
         ref_logratios = reference_chosen_logps - reference_rejected_logps
         logits = pi_logratios - ref_logratios
-
+        # pair_entropy
+        #print("d_theta:", d_theta_fp32)# [718.7297, -2890.9688]
+        #print("q_theta:", q_theta)# [1., 0.]
+        #print("pair_entropy:",pair_entropy_value)# [nan, 1.8421e-07]
+        
         if self.ipo:
             losses = (logits - 1 / (2 * self.beta)) ** 2  # Eq. 17 of https://arxiv.org/pdf/2310.12036v2.pdf
         else:
@@ -388,7 +392,7 @@ class MEPPLoss(nn.Module):
 
         d_theta = logp_chosen - logp_rejected# score gap
         d_theta_fp32 = d_theta.float()
-        q_theta = torch.sigmoid(d_theta)
+        q_theta = torch.sigmoid(d_theta_fp32)
         
         d_0 = ref_logp_chosen - ref_logp_rejected
         d_0_fp32 = d_0.float()
